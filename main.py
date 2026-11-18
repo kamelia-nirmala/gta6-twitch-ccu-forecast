@@ -1,14 +1,25 @@
-"""V3: deterministic launch-day Twitch quantiles; Python 3.13, stdlib only."""
+"""R15: a_calibrated_tod."""
 
 import json
 import math
 import os
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from statistics import median
 
 Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
 CEILING = 1_000_000_000
+MOMENTUM_WEIGHT = 1.155247
+ROBUST_CUTOFF = 0.959268
+SLOPE_BANDWIDTH = 5.807776
+SLOPE_MIX = 0.35959
+SPREAD_WEIGHT = 0.433887
+SKEW = -0.036039
+TREND_WINDOW = 4
+TREND_WEIGHT = 0.31931
+POOL_THRESHOLD = 10057
+TREND_MODE = 'add'
 HOURS = range(2, 25)
 
 
@@ -66,7 +77,7 @@ def utc_time(text):
     return instant.astimezone(timezone.utc)
 
 
-def launch_pool(comparables, *, with_prior=False):
+def launch_pool(comparables, *, with_prior=False, min_anchor=20000):
     if not isinstance(comparables, list):
         raise ValueError("Comparables must be a list")
     pool = []
@@ -98,11 +109,14 @@ def launch_pool(comparables, *, with_prior=False):
             if 0 <= elapsed < 86400:
                 hour = int(elapsed // 3600) + 1
                 series.setdefault(hour, float(value))
-        if series.get(1, 0) >= 20000 and sum(h in series for h in HOURS) >= 20:
+        if series.get(1, 0) >= min_anchor and sum(h in series for h in HOURS) >= 20:
             if with_prior:
                 prior = previous_hour(start, launch["hourly"])
                 if prior is not None:
                     series[0] = prior
+            trend = prelaunch_trend(start, launch["hourly"])
+            if trend is not None:
+                series[-1] = trend
             pool.append((math.log(series[1]), series))
     return pool
 
@@ -133,7 +147,7 @@ def robust_hour(xs, ys):
     for _ in range(3):
         _, deviations, mad = residual_summary(xs, ys, intercept, slope)
         # Exact fits can have zero MAD; a numerical floor avoids infinite weights.
-        cutoff = max(1e-12, 1.5 * 1.4826 * mad)
+        cutoff = max(1e-12, ROBUST_CUTOFF * 1.4826 * mad)
         weights = [1.0 / max(d, cutoff) for d in deviations]
         intercept, slope = least_squares(xs, ys, weights)
     midpoint, deviations, mad = residual_summary(xs, ys, intercept, slope)
@@ -203,7 +217,7 @@ def smoothed_profile(pool, log_p1):
     profile, spread_x, spread_y = {}, [], []
     slopes = {h: fit[2] for h, fit in hourly.items()}
     for hour, (xs, ys, raw_slope) in hourly.items():
-        slope = (raw_slope + smooth_hour(hour, slopes, 6.0)) / 2.0
+        slope = (1.0 - SLOPE_MIX) * raw_slope + SLOPE_MIX * smooth_hour(hour, slopes, SLOPE_BANDWIDTH)
         # Recenter after shrinking the slope so location and spread stay consistent.
         intercept, deviations, mad = residual_summary(xs, ys, 0.0, slope)
         profile[hour] = (log_p1 + intercept + slope * target, max(0.05, 1.4826 * mad) * 1.2)
@@ -231,7 +245,7 @@ def previous_hour(start, history):
     return None
 
 
-def momentum_adjustments(pool, log_p1, log_prior):
+def point_momentum_adjustments(pool, log_p1, log_prior):
     # Compare the boundary jump relative to the typical jump at this anchor.
     curves = [(x, x - math.log(series[0]), series) for x, series in pool if 0 in series]
     if len(curves) < 8:
@@ -248,8 +262,150 @@ def momentum_adjustments(pool, log_p1, log_prior):
         a, b = least_squares(xs, ratios)
         ratios_without_level = [y - a - b * x for x, y in zip(xs, ratios)]
         changes[hour] = robust_hour(jumps, ratios_without_level)[1]
-    weight = 0.5 * max(-2.0, min(2.0, surprise))
+    weight = MOMENTUM_WEIGHT * max(-2.0, min(2.0, surprise))
     return {h: weight * smooth_hour(h, changes, 4.0) for h in HOURS} if changes else {}
+
+
+def prelaunch_trend(start, history):
+    """OLS log-viewer slope per hour; require all N pre-boundary hourly bins."""
+    if not isinstance(history, list):
+        return None
+    bins = {}
+    for point in history:
+        if not isinstance(point, dict) or not isinstance(point.get("from"), str):
+            continue
+        try:
+            offset = (utc_time(point["from"]) - start).total_seconds() / 3600
+            if -TREND_WINDOW <= offset < 0:
+                bins.setdefault(math.floor(offset), (offset, math.log(positive_number(point.get("viewers")))))
+        except (ValueError, TypeError, OverflowError):
+            continue
+    if len(bins) != TREND_WINDOW:
+        return None
+    points = [bins[k] for k in sorted(bins)]
+    return least_squares([p[0] for p in points], [p[1] for p in points])[1]
+
+
+def momentum_adjustments(pool, log_p1, log_prior, trend=None):
+    point = point_momentum_adjustments(pool, log_p1, log_prior)
+    curves = [(x, series[-1], series) for x, series in pool if -1 in series]
+    if trend is None or len(curves) < 8:
+        return point
+    # Remove anchor-level dependence from both the trend and response.
+    intercept, slope = least_squares([x for x, _, _ in curves], [t for _, t, _ in curves])
+    surprise = trend - intercept - slope * log_p1
+    changes = {}
+    for hour in HOURS:
+        points = [(x, t - intercept - slope * x, math.log(series[hour]) - x)
+                  for x, t, series in curves if hour in series]
+        if len(points) < 6:
+            continue
+        xs, trends, ratios = zip(*points)
+        a, b = least_squares(xs, ratios)
+        residuals = [y - a - b * x for x, y in zip(xs, ratios)]
+        changes[hour] = robust_hour(trends, residuals)[1]
+    if not changes:
+        return point
+    weight = TREND_WEIGHT * max(-2.0, min(2.0, surprise))
+    return {h: (point.get(h, 0.0) if TREND_MODE == "add" else 0.0)
+            + weight * smooth_hour(h, changes, 4.0) for h in HOURS}
+
+
+def hourly_spread_factors(pool):
+    """Smooth relative spread errors estimated by LOO inside the training pool."""
+    if len(pool) < 9:
+        return {}
+    errors = {h: [] for h in HOURS}
+    for index, (anchor, series) in enumerate(pool):
+        inner = pool[:index] + pool[index + 1:]
+        profile = smoothed_profile(inner, anchor)
+        updates = momentum_adjustments(inner, anchor, math.log(series[0]), series.get(-1)) if 0 in series else {}
+        for hour, (loc, scale) in profile.items():
+            if hour in series:
+                residual = math.log(series[hour]) - loc - updates.get(hour, 0.0)
+                errors[hour].append(abs(residual) / scale)
+    ratios = {h: max(0.1, median(values)) for h, values in errors.items() if values}
+    if not ratios:
+        return {}
+    typical = median(ratios.values())
+    log_ratios = {h: math.log(value / typical) for h, value in ratios.items()}
+    return {h: math.exp(max(-0.4, min(0.4, SPREAD_WEIGHT * smooth_hour(h, log_ratios, 3.0)))) for h in HOURS}
+
+
+def empirical_quantile(ordered, tau):
+    position = tau * (len(ordered) - 1)
+    left = int(position)
+    right = min(left + 1, len(ordered) - 1)
+    return ordered[left] + (position - left) * (ordered[right] - ordered[left])
+
+
+@lru_cache(maxsize=1)
+def early_late_offsets(pool_key):
+    """Estimate R9-style offsets on held-out training comparables."""
+    offsets = [z + SKEW * z * z for z in Z_SCORES]
+    if len(pool_key) < 10:
+        return offsets, 0.0
+    pool = [(x, dict(points)) for x, points in pool_key]
+    early, late = [], []
+    for index, (anchor, series) in enumerate(pool):
+        inner = pool[:index] + pool[index + 1:]
+        profile = smoothed_profile(inner, anchor)
+        updates = (momentum_adjustments(inner, anchor, math.log(series[0]), series.get(-1))
+                   if 0 in series else {})
+        factors = hourly_spread_factors(inner)
+        for hour, (location, spread) in profile.items():
+            if hour not in series:
+                continue
+            residual = math.log(series[hour]) - location - updates.get(hour, 0.0)
+            if hour < 7:
+                early.append(residual / (spread * factors.get(hour, 1.0)))
+            else:
+                late.append(residual)
+
+    # Keep the median unchanged in hours 2-6 and preserve quantile order.
+    if early:
+        early.sort()
+        for k, tau in ((0, 0.05), (1, 0.25), (3, 0.75), (4, 0.95)):
+            offsets[k] = 0.5 * offsets[k] + 0.5 * empirical_quantile(early, tau)
+        offsets[0] = min(offsets[0], offsets[1], 0.0)
+        offsets[1] = min(0.0, max(offsets[0], offsets[1]))
+        offsets[3] = max(0.0, offsets[3])
+        offsets[4] = max(offsets[3], offsets[4])
+    return offsets, 0.5 * median(late) if late else 0.0
+
+
+def tod_offset(comparables, day_start):
+    """R11 UTC hour and weekday shrinkage (n / (n + 24))."""
+    if not isinstance(day_start, str):
+        return 0.0
+    try:
+        start = utc_time(day_start)
+    except (ValueError, OverflowError):
+        return 0.0
+    observations = []
+    for launch in comparables:
+        if not isinstance(launch, dict) or not isinstance(launch.get("day_start"), str):
+            continue
+        try:
+            dt = utc_time(launch["day_start"])
+            one = launch_pool([launch], with_prior=True, min_anchor=10000)
+            if one:
+                x, series = one[0]
+                levels = [math.log(series[h]) - x for h in HOURS if h in series]
+                if levels:
+                    observations.append((dt.hour, dt.weekday(), median(levels)))
+        except (ValueError, TypeError, OverflowError, KeyError):
+            continue
+    if observations:
+        global_level = median(value for _, _, value in observations)
+        hour_values = [value for hour, _, value in observations if hour == start.hour]
+        day_values = [value for _, day, value in observations if day == start.weekday()]
+        hour_offset = ((median(hour_values) - global_level) * len(hour_values) / (len(hour_values) + 24.0)
+                       if len(hour_values) >= 2 else 0.0)
+        day_offset = ((median(day_values) - global_level) * len(day_values) / (len(day_values) + 24.0)
+                      if len(day_values) >= 2 else 0.0)
+        return max(-0.5, min(0.5, hour_offset + day_offset))
+    return 0.0
 
 
 def forecast(case, p1):
@@ -261,7 +417,8 @@ def forecast(case, p1):
             prior = previous_hour(utc_time(day_start), case.get("history_hourly"))
         except (ValueError, OverflowError):
             pass
-    strict = launch_pool(comparables, with_prior=prior is not None)
+    # Expand forecast training only. The default pool still defines the LOO cohort.
+    strict = launch_pool(comparables, with_prior=prior is not None, min_anchor=POOL_THRESHOLD)
     if len(strict) < 6:
         return forecast_v2(strict, p1)
     try:
@@ -269,14 +426,25 @@ def forecast(case, p1):
         profile = smoothed_profile(strict, log_p1)
         if any(h not in profile for h in HOURS):
             return forecast_v2(strict, p1)
-        updates = momentum_adjustments(strict, log_p1, math.log(prior)) if prior is not None else {}
+        updates = momentum_adjustments(strict, log_p1, math.log(prior),
+                                       prelaunch_trend(utc_time(day_start), case.get("history_hourly"))) if prior is not None else {}
+        factors = hourly_spread_factors(strict)
+        nominal = [z + SKEW * z * z for z in Z_SCORES]
+        early, late_bias = nominal, 0.0
+        key = tuple((anchor, tuple(series.items())) for anchor, series in strict)
+        early, late_bias = early_late_offsets(key)
+        clock_offset = tod_offset(comparables, day_start)
         low, high = math.log(0.01), math.log(CEILING)
         rows = []
         for hour in HOURS:
             location, spread = profile[hour]
-            location += updates.get(hour, 0.0)
+            spread *= factors.get(hour, 1.0)
+            location += updates.get(hour, 0.0) + clock_offset
+            offsets = early if hour < 7 else nominal
+            if hour >= 7:
+                location += late_bias
             qs = [rounded_viewers(math.exp(max(low, min(high, location + z * spread))))
-                  for z in Z_SCORES]
+                  for z in offsets]
             rows.append({"hour": hour, "q": qs})
         return {"hours": rows}
     except (ArithmeticError, ValueError):
